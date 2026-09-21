@@ -5,7 +5,6 @@ from models.player import Player as BasePlayer
 
 
 class Player7(BasePlayer):
-
 	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
 		super().__init__(snapshot, ctx)
 		self.days_seen = 0
@@ -23,9 +22,7 @@ class Player7(BasePlayer):
 		# if we have options, wear the freshest ones and save the old ones
 		# to hole out on their own -- that gives us free restocks
 		free_pairs = [
-			(i, j)
-			for i, j in combinations(range(n), 2)
-			if abs(offered[i] - offered[j]) <= 6
+			(i, j) for i, j in combinations(range(n), 2) if abs(offered[i] - offered[j]) <= 6
 		]
 
 		if free_pairs:
@@ -33,8 +30,7 @@ class Player7(BasePlayer):
 		else:
 			# no free pair today, just minimize the damage
 			wear_idx = min(
-				combinations(range(n), 2),
-				key=lambda p: abs(offered[p[0]] - offered[p[1]])
+				combinations(range(n), 2), key=lambda p: abs(offered[p[0]] - offered[p[1]])
 			)
 
 		leftovers = [i for i in range(n) if i not in wear_idx]
@@ -43,7 +39,7 @@ class Player7(BasePlayer):
 		# figure out if we can afford to throw socks away
 		# every 6 discards of the same color buys a fresh pack
 		# rule of thumb: if budget / days left >= 10/6, we're keeping pace
-		broke = (turn.budget_remaining == 0)
+		broke = turn.budget_remaining == 0
 		days_remaining = max(self.days - turn.day + 1, 1)
 
 		if turn.budget_remaining == float('inf'):
