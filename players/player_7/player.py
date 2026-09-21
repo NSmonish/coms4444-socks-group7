@@ -61,10 +61,9 @@ class Player7(BasePlayer):
 			if shade == 127 or shade == 64:
 				discard_idx.append(idx)
 
-			elif can_spend:
+			elif can_spend and abs(shade - worn_shade) > 6:
 				# if we're on budget, also toss socks too far from what we wore
 				# they're hard to match and not worth keeping around
-				if abs(shade - worn_shade) > 6:
-					discard_idx.append(idx)
+				discard_idx.append(idx)
 
 		return Selection(wear=wear_idx, discard=tuple(discard_idx))
