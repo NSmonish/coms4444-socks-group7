@@ -39,6 +39,12 @@ PARAMS = {
 	# only toss freely if the house's spending pace so far, kept up until the
 	# end, still leaves the money we need for holes
 	'pace_guard': 1,
+	# the tight-money changes above only kick in when the drawer is tight:
+	# C below this many times (socks drawn a day x roommates). with a roomier
+	# drawer the plain rules did better in testing
+	'tight_cap': 1.5,
+	# ...or when the whole budget is this thin (dollars per roommate per day)
+	'thin_rate': 0.05,
 }
 
 
@@ -67,6 +73,20 @@ class Player7(BasePlayer):
 		self.last_day = 0
 		# spare money we can use on swaps, counted in socks
 		self.credit = 0.0
+		# roomy drawer: play the plain rules (no pace guard, keep tossing worn
+		# out socks, one swap a turn on anything past protect_age)
+		self.tight_drawer = (
+			self.capacity / (self.selection_unit * self.roommates) < PARAMS['tight_cap']
+		)
+		self.use_new = None
+		self.plain = {
+			**PARAMS,
+			'pace_guard': 0,
+			'keep_worn_tight': 0,
+			'max_swaps': 1,
+			'swap_age_lo': PARAMS['protect_age'],
+			'swap_age_hi': 64,
+		}
 		# living alone we can follow the whole drawer: shade -> how many.
 		# holes are the only thing we can't see, so a worn out sock we wear
 		# comes back counted as 0.75 of a sock
@@ -172,7 +192,12 @@ class Player7(BasePlayer):
 
 	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
 		n = len(offered)
-		p = PARAMS
+		if self.use_new is None:
+			# decide once, on day 1: the whole budget over the whole run
+			total = turn.total_spent + turn.budget_remaining
+			thin = total / (self.roommates * self.days) < PARAMS['thin_rate']
+			self.use_new = self.tight_drawer or thin
+		p = PARAMS if self.use_new else self.plain
 		self.remember(offered, turn.day)
 		if self.solo:
 			self.solo_update(offered, turn)
