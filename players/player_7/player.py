@@ -1,3 +1,25 @@
+"""Player 74: pick a spending regime from the budget, then play it out.
+
+The budget decides almost everything, so on the first morning we work out how
+many wears each sock would have to last if the household spent its money at a
+steady rate (the house wears 2n socks a day; with d affordable new socks a
+day, each sock has to last 2n/d wears). That number puts us in one of three
+regimes for the rest of the run:
+
+- LAVISH  money is no object - toss anything that stands out from the
+  pair we wore, so the drawer stays bunched up near new.
+- PACED   money is moderate - toss anything that has outlived its share
+  of wears, which spends the budget evenly instead of in bursts.
+- PRICED  money is thin - every move gets a price in embarrassment
+  points, and we take the cheapest one.
+
+Ideas borrowed from other groups, reimplemented here:
+- the 2n/d steady-state wear count (group 10)
+- pricing a whole move - mismatch, dollars and drawer shape - in one
+  number, and counting a worn out sock's hole risk as money (group 3)
+"""
+
+from dataclasses import dataclass, replace
 from itertools import combinations
 
 from models.player import GameContext, PlayerSnapshot, Selection, TurnContext
@@ -5,267 +27,478 @@ from models.player import Player as BasePlayer
 
 PACK_COST = 10.0
 SOCK_COST = PACK_COST / 6
+FREE_GAP = 6
+WHITE_NEW, WHITE_DONE = 255, 127
+BLACK_NEW, BLACK_DONE = 0, 64
 
-# numbers we settled on after a lot of simulation runs
-PARAMS = {
-	# toss odd socks freely only if money left per day is at least this much
-	# per roommate
-	'spend_per_rm': 10 / 6 / 2,
-	# roughly how many socks per roommate per day die from holes once the
-	# drawer is worn in
-	'hole_rate': 1 / 34,
-	# penalty for wearing a worn out sock when we think we'll run dry
-	'hole_weight': 1000.0,
-	# extra socks to keep above the bare minimum
-	'dry_margin': 4,
-	# never toss socks younger than this many washes
-	'protect_age': 2,
-	# low budget stuff:
-	# how quickly old sightings fade from our picture of the drawer (per day)
-	'decay': 0.97,
-	# money kept back for holes before anything counts as spare
-	'low_reserve': 1.0,
-	# only swap a sock out if a new one would find a free match this much
-	# more often
-	'gain_min': 0.1,
-	# tight money: how many swaps we can make in one turn
-	'max_swaps': 2,
-	# tight money: swap socks in this wash range (fresh ones will fit in by
+
+# ----------------------------------------------------------------------
+# tuning
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Knobs:
+	"""Every tunable number, with what it does."""
+
+	# lavish tossing needs at least this much money per roommate per day
+	lavish_per_roommate: float = SOCK_COST / 2
+	# socks per roommate per day lost to holes once the drawer is worn in
+	hole_rate: float = 1 / 34
+	# penalty for wearing a worn out sock when we expect to run dry
+	dry_penalty: float = 1000.0
+	# socks to keep above the bare minimum before we call it running dry
+	dry_margin: int = 4
+	# never toss a sock with fewer wears than this
+	min_toss_wears: int = 2
+	# daily fade of old sightings in the drawer memory (ruled regimes)
+	memory_fade: float = 0.97
+	# how many hole replacements' worth of money to hold back
+	hole_reserve: float = 1.0
+	# a swap has to raise the free match chance by at least this much
+	swap_min_gain: float = 0.1
+	# swaps allowed per turn when money is tight
+	swaps_per_turn: int = 2
+	# only swap socks with this many wears (fresh ones blend in by
 	# themselves, worn out ones still match the other old socks)
-	'swap_age_lo': 3,
-	'swap_age_hi': 30,
-	# tight money: keep worn out socks instead of paying to replace them
-	'keep_worn_tight': 1,
-	# only toss freely if the house's spending pace so far, kept up until the
-	# end, still leaves the money we need for holes
-	'pace_guard': 1,
-	# the tight-money changes above only kick in when the drawer is tight:
-	# C below this many times (socks drawn a day x roommates). with a roomier
-	# drawer the plain rules did better in testing
-	'tight_cap': 1.5,
-	# ...or when the whole budget is this thin (dollars per roommate per day)
-	'thin_rate': 0.05,
-}
+	swap_wears: tuple[int, int] = (3, 30)
+	# with tight money keep worn out socks instead of paying to replace them
+	keep_worn_when_tight: bool = True
+	# stop lavish tossing if the house's pace so far would eat the hole money
+	pace_guard: bool = True
+	# a drawer is tight when C is below this many times the daily draw
+	tight_drawer: float = 1.5
+	# ...and a budget is thin below this many dollars per roommate per day
+	thin_dollars: float = 0.05
+	# paced regime only while each sock must last at most this many wears
+	paced_max_wears: float = 25
+	# priced regime when, on day 1, each sock must last more than this
+	priced_min_wears: float = 13
+	# priced regime: points per dollar when the credit bank is empty
+	point_per_dollar: float = 3.0
+	# priced regime: weight on how much better a fresh sock would fit
+	fit_weight: float = 1.0
+	# priced regime: daily fade of old sightings
+	priced_memory_fade: float = 0.9
+	# priced regime: most discard credit we can bank, and use in one turn
+	bank_cap: float = 10.0
+	priced_tosses_per_turn: int = 2
 
 
-def age(shade: int) -> int:
-	# rough wash count (white fades 255->127 by 2, black 0->64 by 1)
-	return (255 - shade) // 2 if shade > 64 else shade
+TUNED = Knobs()
+# with a roomy drawer the plainer rules did better in testing
+ROOMY = replace(
+	TUNED,
+	pace_guard=False,
+	keep_worn_when_tight=False,
+	swaps_per_turn=1,
+	swap_wears=(TUNED.min_toss_wears, 64),
+)
 
 
-def worn_out(shade: int) -> bool:
-	return shade == 127 or shade == 64
+# ----------------------------------------------------------------------
+# shade arithmetic
+# ----------------------------------------------------------------------
 
 
-def mismatch(a: int, b: int) -> int:
-	d = abs(a - b)
-	return d if d > 6 else 0
+def is_white(shade: int) -> bool:
+	return shade > BLACK_DONE
 
 
-class Player7(BasePlayer):
-	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
-		super().__init__(snapshot, ctx)
-		self.days_seen = 0
-		# day the money ran out - holes don't get replaced after that
-		self.broke_since = None
-		# shades we've been handed lately, as weighted counts
-		self.seen = {'w': {}, 'b': {}}
+def wears(shade: int) -> int:
+	"""Rough wash count: white fades 2 a wash, black darkens 1."""
+	return (WHITE_NEW - shade) // 2 if is_white(shade) else shade
+
+
+def is_done(shade: int) -> bool:
+	"""Faded all the way, so every wear risks a hole."""
+	return shade in (WHITE_DONE, BLACK_DONE)
+
+
+def charge(a: int, b: int) -> int:
+	"""What the engine bills for wearing a and b together."""
+	gap = abs(a - b)
+	return gap if gap > FREE_GAP else 0
+
+
+def brand_new(shade: int) -> int:
+	return WHITE_NEW if is_white(shade) else BLACK_NEW
+
+
+def after_wash(shade: int) -> int:
+	return max(WHITE_DONE, shade - 2) if is_white(shade) else min(BLACK_DONE, shade + 1)
+
+
+def colour(shade: int) -> str:
+	return 'w' if is_white(shade) else 'b'
+
+
+# ----------------------------------------------------------------------
+# what we remember about the drawer
+# ----------------------------------------------------------------------
+
+
+class ShadeMemory:
+	"""Decayed counts of the shades we've been handed, per colour."""
+
+	def __init__(self, fade: float, forget_below: float) -> None:
+		self.fade = fade
+		self.forget_below = forget_below
+		self.counts: dict[str, dict[int, float]] = {'w': {}, 'b': {}}
 		self.last_day = 0
-		# spare money we can use on swaps, counted in socks
-		self.credit = 0.0
-		# roomy drawer: play the plain rules (no pace guard, keep tossing worn
-		# out socks, one swap a turn on anything past protect_age)
-		self.tight_drawer = (
-			self.capacity / (self.selection_unit * self.roommates) < PARAMS['tight_cap']
-		)
-		self.use_new = None
-		self.plain = {
-			**PARAMS,
-			'pace_guard': 0,
-			'keep_worn_tight': 0,
-			'max_swaps': 1,
-			'swap_age_lo': PARAMS['protect_age'],
-			'swap_age_hi': 64,
-		}
-		# living alone we can follow the whole drawer: shade -> how many.
-		# holes are the only thing we can't see, so a worn out sock we wear
-		# comes back counted as 0.75 of a sock
-		self.solo = self.roommates == 1
-		if self.solo:
-			half = self.capacity // 2
-			self.drawer = {255: float(half), 0: float(half)}
-			self.pending = {'w': 0.0, 'b': 0.0}
-			self.last_spent = 0.0
-			self.last_hand = None
-			self.touched = set()
 
-	def will_run_dry(self, turn: TurnContext, left: float, days_left: int) -> bool:
-		# rough guess - will holes from here on use up the spare socks plus
-		# whatever the money left can still replace?
-		p = PARAMS
-		n = self.roommates
-		lost = 0.0
-		if self.broke_since is not None:
-			lost = p['hole_rate'] * n * (turn.day - self.broke_since)
-		spare = self.capacity - lost - self.selection_unit * n - p['dry_margin']
-		holes = p['hole_rate'] * n * days_left
-		return holes > spare + left / SOCK_COST
-
-	def remember(self, offered: tuple[int, ...], day: int) -> None:
-		fade = PARAMS['decay'] ** max(day - self.last_day, 1)
+	def observe(self, hand: tuple[int, ...], day: int) -> None:
+		factor = self.fade ** max(day - self.last_day, 1)
 		self.last_day = day
-		for hist in self.seen.values():
-			for shade in list(hist):
-				hist[shade] *= fade
-				if hist[shade] < 0.01:
-					del hist[shade]
-		for shade in offered:
-			hist = self.seen['w' if shade > 64 else 'b']
-			hist[shade] = hist.get(shade, 0.0) + 1.0
+		for counts in self.counts.values():
+			for shade in list(counts):
+				counts[shade] *= factor
+				if counts[shade] < self.forget_below:
+					del counts[shade]
+		for shade in hand:
+			counts = self.counts[colour(shade)]
+			counts[shade] = counts.get(shade, 0.0) + 1.0
 
-	def free_match_chance(self, shade: int) -> float:
-		# chance at least one of the other socks in a hand is within 6 shades
-		# of this one - from the real drawer if we live alone, else from what
-		# we've been seeing lately
-		if self.solo:
-			white = shade > 64
-			hist = {k: v for k, v in self.drawer.items() if (k > 64) == white}
-			total = sum(self.drawer.values())
-		else:
-			hist = self.seen['w' if shade > 64 else 'b']
-			total = sum(self.seen['w'].values()) + sum(self.seen['b'].values())
-		if total == 0:
-			return 1.0
-		near = sum(w for s, w in hist.items() if abs(s - shade) <= 6) / total
-		return 1.0 - (1.0 - near) ** (self.selection_unit - 1)
+	def same_colour(self, shade: int) -> dict[int, float]:
+		return self.counts[colour(shade)]
 
-	def swap_gain(self, shade: int) -> float:
-		# how much more often a brand new sock would find a free match
-		fresh = 255 if shade > 64 else 0
-		return self.free_match_chance(fresh) - self.free_match_chance(shade)
+	def total(self) -> float:
+		return sum(self.counts['w'].values()) + sum(self.counts['b'].values())
 
-	def solo_update(self, offered: tuple[int, ...], turn: TurnContext) -> None:
-		# put yesterday's socks back, count any packs bought, then take out today's hand
-		if self.last_hand is not None:
-			for shade, weight in self.last_hand:
-				self.drawer[shade] = self.drawer.get(shade, 0.0) + weight
-		packs = round((turn.total_spent - self.last_spent) / PACK_COST)
-		self.last_spent = turn.total_spent
+
+class SoloLedger:
+	"""Living alone we can follow the whole drawer, shade -> how many.
+
+	Holes are the one thing we can't see, so a worn out sock we wear comes
+	back counted as 0.75 of a sock and the other 0.25 waits for a new pack.
+	"""
+
+	def __init__(self, capacity: int) -> None:
+		half = float(capacity // 2)
+		self.drawer: dict[int, float] = {WHITE_NEW: half, BLACK_NEW: half}
+		self.owed = {'w': 0.0, 'b': 0.0}
+		self.spent_seen = 0.0
+		self.returning: list[tuple[int, float]] | None = None
+		self.lost_today: set[str] = set()
+
+	def morning(self, hand: tuple[int, ...], turn: TurnContext) -> None:
+		# last night's socks come back, any new packs go in, today's hand comes out
+		for shade, weight in self.returning or ():
+			self.drawer[shade] = self.drawer.get(shade, 0.0) + weight
+		packs = round((turn.total_spent - self.spent_seen) / PACK_COST)
+		self.spent_seen = turn.total_spent
 		for _ in range(packs):
-			# living alone, a pack can only be for a colour we tossed or wore
-			# out yesterday. if that's both, go by whose count is nearer 6
-			active = [c for c in self.pending if c in self.touched] or list(self.pending)
-			color = max(active, key=lambda c: self.pending[c])
-			self.pending[color] = max(0.0, self.pending[color] - 6)
-			fresh = 255 if color == 'w' else 0
+			# a pack can only be for a colour we lost yesterday; if both, go by
+			# whose count is closer to 6
+			lost = [c for c in self.owed if c in self.lost_today] or list(self.owed)
+			c = max(lost, key=lambda k: self.owed[k])
+			self.owed[c] = max(0.0, self.owed[c] - 6)
+			fresh = WHITE_NEW if c == 'w' else BLACK_NEW
 			self.drawer[fresh] = self.drawer.get(fresh, 0.0) + 6
-		for shade in offered:
-			left = self.drawer.get(shade, 0.0) - 1
-			if left > 0.01:
-				self.drawer[shade] = left
+		for shade in hand:
+			rest = self.drawer.get(shade, 0.0) - 1
+			if rest > 0.01:
+				self.drawer[shade] = rest
 			else:
 				self.drawer.pop(shade, None)
 
-	def solo_after(self, offered: tuple[int, ...], wear_idx, discard_idx) -> None:
-		# remember what goes back tonight and what's waiting to be replaced
-		back = []
-		for i, shade in enumerate(offered):
-			color = 'w' if shade > 64 else 'b'
-			if i in wear_idx:
-				washed = max(127, shade - 2) if shade > 64 else min(64, shade + 1)
-				if worn_out(shade):
-					back.append((washed, 0.75))
-					self.pending[color] += 0.25
-				else:
-					back.append((washed, 1.0))
-			elif i in discard_idx:
-				self.pending[color] += 1
+	def evening(self, hand: tuple[int, ...], wear: tuple[int, int], toss: list[int]) -> None:
+		self.returning = []
+		for i, shade in enumerate(hand):
+			if i in wear:
+				share = 0.75 if is_done(shade) else 1.0
+				self.returning.append((after_wash(shade), share))
+				self.owed[colour(shade)] += 1.0 - share
+			elif i in toss:
+				self.owed[colour(shade)] += 1
 			else:
-				back.append((shade, 1.0))
-		self.last_hand = back
-		# which colours we tossed or wore out today (so a pack could be for them)
-		self.touched = {
-			'w' if offered[i] > 64 else 'b'
-			for i in range(len(offered))
-			if i in discard_idx or (i in wear_idx and worn_out(offered[i]))
+				self.returning.append((shade, 1.0))
+		self.lost_today = {
+			colour(hand[i])
+			for i in range(len(hand))
+			if i in toss or (i in wear and is_done(hand[i]))
 		}
 
-	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
-		n = len(offered)
-		if self.use_new is None:
-			# decide once, on day 1: the whole budget over the whole run
-			total = turn.total_spent + turn.budget_remaining
-			thin = total / (self.roommates * self.days) < PARAMS['thin_rate']
-			self.use_new = self.tight_drawer or thin
-		p = PARAMS if self.use_new else self.plain
-		self.remember(offered, turn.day)
-		if self.solo:
-			self.solo_update(offered, turn)
+	def same_colour(self, shade: int) -> dict[int, float]:
+		white = is_white(shade)
+		return {s: w for s, w in self.drawer.items() if is_white(s) == white}
 
+	def total(self) -> float:
+		return sum(self.drawer.values())
+
+
+# ----------------------------------------------------------------------
+# money
+# ----------------------------------------------------------------------
+
+
+def hole_money(k: Knobs, roommates: int, days: int) -> float:
+	"""Money to hold back for replacing holes over this many days."""
+	return k.hole_reserve * k.hole_rate * roommates * days * SOCK_COST
+
+
+def socks_per_day(k: Knobs, money: float, roommates: int, days: int) -> float:
+	"""New socks a day the house can afford once the hole money is set aside."""
+	return (money - hole_money(k, roommates, days)) / days / SOCK_COST
+
+
+@dataclass
+class Wallet:
+	"""Where the household's money stands this morning."""
+
+	have_money: bool = True
+	lavish: bool = True
+	running_dry: bool = False
+	# wears each sock should last when spending evenly (None: not pacing)
+	share: float | None = None
+
+
+# ----------------------------------------------------------------------
+# the player
+# ----------------------------------------------------------------------
+
+
+class Player74(BasePlayer):
+	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
+		super().__init__(snapshot, ctx)
+		self.regime: str | None = None
+		self.knobs = TUNED
+		self.memory = ShadeMemory(TUNED.memory_fade, 0.01)
+		self.solo = SoloLedger(self.capacity) if self.roommates == 1 else None
+		# ruled regimes
+		self.broke_since: int | None = None
+		self.swap_credit = 0.0
+		# priced regime
+		self.bank = 0.0
+		self.my_spend = 0.0
+		self.target_wears = 64.0
+		self.trust_target = 0.0
+
+	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
+		if self.regime is None:
+			self.settle_regime(turn)
+		if self.regime == 'priced':
+			return self.priced_turn(offered, turn)
+		return self.ruled_turn(offered, turn)
+
+	def settle_regime(self, turn: TurnContext) -> None:
+		# decided once, from the whole budget over the whole run
+		k = TUNED
+		budget = turn.total_spent + turn.budget_remaining
+		if budget != float('inf'):
+			rate = socks_per_day(k, budget, self.roommates, self.days)
+			if rate <= 0 or 2 * self.roommates / rate > k.priced_min_wears:
+				self.regime = 'priced'
+				self.memory = ShadeMemory(k.priced_memory_fade, 1e-3)
+				return
+		self.regime = 'ruled'
+		tight = self.capacity / (self.selection_unit * self.roommates) < k.tight_drawer
+		thin = budget / (self.roommates * self.days) < k.thin_dollars
+		self.knobs = TUNED if tight or thin else ROOMY
+		self.memory = ShadeMemory(k.memory_fade, 0.01)
+
+	# ------------------------------------------------------------------
+	# lavish / paced: fixed rules
+	# ------------------------------------------------------------------
+
+	def ruled_turn(self, hand: tuple[int, ...], turn: TurnContext) -> Selection:
+		self.memory.observe(hand, turn.day)
+		if self.solo:
+			self.solo.morning(hand, turn)
+
+		wallet, k = self.check_wallet(turn)
+		wear = self.closest_pair(hand, avoid_done=wallet.running_dry, k=k)
+		rest = [i for i in range(len(hand)) if i not in wear]
+
+		share = wallet.share
+		spending = wallet.have_money and not wallet.running_dry and not wallet.lavish
+		if share is not None and spending:
+			toss = [i for i in rest if wears(hand[i]) >= max(share, k.min_toss_wears)]
+			return self.finish(hand, wear, toss)
+
+		toss = self.rule_tosses(hand, wear, rest, wallet, k)
+		if wallet.have_money and not wallet.lavish and not wallet.running_dry:
+			toss += self.swaps(hand, rest, toss, k)
+		return self.finish(hand, wear, toss)
+
+	def check_wallet(self, turn: TurnContext) -> tuple[Wallet, Knobs]:
+		k, n = self.knobs, self.roommates
 		days_left = max(self.days - turn.day + 1, 1)
 		left = turn.budget_remaining
 		if left == float('inf'):
-			have_money, can_spend, short = True, True, False
-		else:
-			have_money = left >= PACK_COST
-			if not have_money and self.broke_since is None:
-				self.broke_since = turn.day
-			can_spend = have_money and left / days_left >= p['spend_per_rm'] * self.roommates
-			# don't go on a tossing spree if the whole house is already spending too fast
-			if can_spend and p['pace_guard'] and turn.day > 20:
-				pace = turn.total_spent / turn.day
-				hole_bill = p['hole_rate'] * self.roommates * days_left * SOCK_COST
-				can_spend = pace * days_left <= left - p['low_reserve'] * hole_bill
-			short = self.will_run_dry(turn, left if have_money else 0.0, days_left)
-			# low budget - whatever we don't need for holes is spare. spread it
-			# over the days left and split it between roommates so copies of
-			# us in the same house don't each spend all of it
-			holes = p['hole_rate'] * self.roommates * days_left * SOCK_COST
-			spare = left - p['low_reserve'] * holes
-			if spare > 0 and not short:
-				self.credit = min(self.credit + spare / days_left / self.roommates / SOCK_COST, 3.0)
+			return Wallet(), k
 
-		# wear the closest pair, fresher ones if tied. if we think we'll run
-		# dry, also stay off worn out socks since each wear can lose one
-		hole_w = p['hole_weight'] if short else 0.0
+		wallet = Wallet()
+		rate = socks_per_day(TUNED, left, n, days_left)
+		if rate > 0 and 2 * n / rate <= TUNED.paced_max_wears:
+			wallet.share = 2 * n / rate
+			k = TUNED
 
-		def cost(pair):
-			a, b = offered[pair[0]], offered[pair[1]]
-			return (mismatch(a, b) + hole_w * (worn_out(a) + worn_out(b)), age(a) + age(b))
+		wallet.have_money = left >= PACK_COST
+		if not wallet.have_money and self.broke_since is None:
+			self.broke_since = turn.day
+		wallet.lavish = wallet.have_money and left / days_left >= k.lavish_per_roommate * n
+		if wallet.lavish and k.pace_guard and wallet.share is None and turn.day > 20:
+			# the house's spending pace so far, kept up to the end, must still
+			# leave the money we need for holes
+			pace = turn.total_spent / turn.day
+			wallet.lavish = pace * days_left <= left - hole_money(k, n, days_left)
+		wallet.running_dry = self.running_dry(turn, left if wallet.have_money else 0.0, days_left)
 
-		wear_idx = min(combinations(range(n), 2), key=cost)
-		leftovers = [i for i in range(n) if i not in wear_idx]
-		worn_shade = (offered[wear_idx[0]] + offered[wear_idx[1]]) / 2
+		# whatever isn't needed for holes is spare: spread it over the days
+		# left and split it between roommates so copies of us don't each
+		# spend all of it
+		spare = left - hole_money(k, n, days_left)
+		if spare > 0 and not wallet.running_dry:
+			self.swap_credit = min(self.swap_credit + spare / days_left / n / SOCK_COST, 3.0)
+		return wallet, k
 
-		discard_idx = []
-		for idx in leftovers:
-			shade = offered[idx]
-			if worn_out(shade):
-				# worn out socks go while there's money to replace them, but
-				# if we're about to run dry every sock counts so keep it
-				# with tight money a worn out sock still matches the other old ones
-				tight = not can_spend and p['keep_worn_tight']
-				if have_money and not short and not tight:
-					discard_idx.append(idx)
-			elif can_spend and shade != worn_shade and age(shade) >= p['protect_age']:
-				# plenty of money - drop the odd ones out so the drawer stays tight
-				discard_idx.append(idx)
+	def running_dry(self, turn: TurnContext, left: float, days_left: int) -> bool:
+		# will holes from here on eat the spare socks plus what money can replace?
+		k, n = TUNED, self.roommates
+		lost = 0.0
+		if self.broke_since is not None:
+			lost = k.hole_rate * n * (turn.day - self.broke_since)
+		spare = self.capacity - lost - self.selection_unit * n - k.dry_margin
+		return k.hole_rate * n * days_left > spare + left / SOCK_COST
 
-		# tight money - spend the small spare credit on a couple of mid-aged socks
-		# that fit in worst with the rest of the drawer, worst fit first
-		if have_money and not can_spend and not short:
-			options = [
-				i
-				for i in leftovers
-				if i not in discard_idx and p['swap_age_lo'] <= age(offered[i]) <= p['swap_age_hi']
-			]
-			options.sort(key=lambda i: -self.swap_gain(offered[i]))
-			for i in options[: p['max_swaps']]:
-				if self.credit < 1.0 or self.swap_gain(offered[i]) < p['gain_min']:
-					break
-				discard_idx.append(i)
-				self.credit -= 1.0
+	@staticmethod
+	def closest_pair(hand: tuple[int, ...], avoid_done: bool, k: Knobs) -> tuple[int, int]:
+		# cheapest pair, fresher if tied; when running dry every hole is a
+		# sock we never get back, so stay off worn out socks
+		penalty = k.dry_penalty if avoid_done else 0.0
 
+		def score(pair: tuple[int, int]) -> tuple[float, int]:
+			a, b = hand[pair[0]], hand[pair[1]]
+			return (charge(a, b) + penalty * (is_done(a) + is_done(b)), wears(a) + wears(b))
+
+		return min(combinations(range(len(hand)), 2), key=score)
+
+	@staticmethod
+	def rule_tosses(
+		hand: tuple[int, ...], wear: tuple[int, int], rest: list[int], wallet: Wallet, k: Knobs
+	) -> list[int]:
+		worn_shade = (hand[wear[0]] + hand[wear[1]]) / 2
+		toss = []
+		for i in rest:
+			shade = hand[i]
+			if is_done(shade):
+				# replace worn out socks while we can, unless every sock counts
+				# or money is tight (they still match the other old ones)
+				keep = wallet.running_dry or (not wallet.lavish and k.keep_worn_when_tight)
+				if wallet.have_money and not keep:
+					toss.append(i)
+			elif wallet.lavish and shade != worn_shade and wears(shade) >= k.min_toss_wears:
+				# plenty of money: drop the odd ones out
+				toss.append(i)
+		return toss
+
+	def swaps(self, hand: tuple[int, ...], rest: list[int], toss: list[int], k: Knobs) -> list[int]:
+		# tight money: spend banked credit on the mid-aged socks that fit in
+		# worst, worst first
+		lo, hi = k.swap_wears
+		picks = [i for i in rest if i not in toss and lo <= wears(hand[i]) <= hi]
+		picks.sort(key=lambda i: -self.swap_gain(hand[i]))
+		chosen = []
+		for i in picks[: k.swaps_per_turn]:
+			if self.swap_credit < 1.0 or self.swap_gain(hand[i]) < k.swap_min_gain:
+				break
+			chosen.append(i)
+			self.swap_credit -= 1.0
+		return chosen
+
+	def swap_gain(self, shade: int) -> float:
+		# how much more often a brand new sock would find a free match
+		return self.match_chance(brand_new(shade)) - self.match_chance(shade)
+
+	def match_chance(self, shade: int) -> float:
+		# chance another sock in the hand is within the free gap of this one
+		source = self.solo or self.memory
+		total = source.total()
+		if total == 0:
+			return 1.0
+		near = sum(w for s, w in source.same_colour(shade).items() if abs(s - shade) <= FREE_GAP)
+		return 1.0 - (1.0 - near / total) ** (self.selection_unit - 1)
+
+	def finish(self, hand: tuple[int, ...], wear: tuple[int, int], toss: list[int]) -> Selection:
 		if self.solo:
-			self.solo_after(offered, wear_idx, discard_idx)
-		return Selection(wear=wear_idx, discard=tuple(discard_idx))
+			self.solo.evening(hand, wear, toss)
+		return Selection(wear=wear, discard=tuple(toss))
+
+	# ------------------------------------------------------------------
+	# priced: cheapest move wins
+	# ------------------------------------------------------------------
+
+	def priced_turn(self, hand: tuple[int, ...], turn: TurnContext) -> Selection:
+		k, n = TUNED, self.roommates
+		self.memory.observe(hand, turn.day)
+		days_left = max(self.days - turn.day + 1, 1)
+		left = turn.budget_remaining
+		broke = left < PACK_COST
+
+		tosses_allowed = self.fill_bank(turn, left, days_left) if not broke else 0
+
+		# the drawer our budget is steering towards: ages spread evenly up to
+		# the wear count we can afford, trusted more the faster we replace
+		rate = max(0.0, socks_per_day(k, left, n, days_left)) + k.hole_rate * n
+		self.target_wears = 2 * n / rate
+		self.trust_target = min(1.0, rate * min(30, days_left) / self.capacity)
+
+		# money is cheap while the bank is full, priceless once it's gone
+		per_dollar = k.point_per_dollar * max(0.0, 1.0 - self.bank / k.bank_cap)
+		if broke:
+			per_dollar = 1000.0
+		new_sock = per_dollar * SOCK_COST
+
+		# wearing a worn out sock is a 25% chance of paying for a new one;
+		# tossing pays for one but trades this sock's fit for a fresh one's
+		wear_price = [0.25 * new_sock * is_done(s) for s in hand]
+		toss_price = [
+			new_sock + k.fit_weight * (self.misfit(brand_new(s)) - self.misfit(s)) for s in hand
+		]
+
+		def move(pair: tuple[int, int]) -> tuple[tuple[float, int, int], tuple[int, ...]]:
+			i, j = pair
+			worth_it = sorted(
+				(toss_price[x], x) for x in range(len(hand)) if x not in pair and toss_price[x] < 0
+			)[:tosses_allowed]
+			price = charge(hand[i], hand[j]) + wear_price[i] + wear_price[j]
+			price += sum(p for p, _ in worth_it)
+			return (price, len(worth_it), wears(hand[i]) + wears(hand[j])), tuple(
+				sorted(x for _, x in worth_it)
+			)
+
+		moves = [(pair, *move(pair)) for pair in combinations(range(len(hand)), 2)]
+		wear, _, toss = min(moves, key=lambda m: m[1])
+		self.bank -= len(toss)
+		self.my_spend += len(toss) * SOCK_COST
+		return Selection(wear=wear, discard=toss)
+
+	def fill_bank(self, turn: TurnContext, left: float, days_left: int) -> int:
+		"""Bank our share of today's spare money; return tosses allowed today.
+
+		What the house spent minus what we spent is the roommates' pace. Project
+		it forward, keep a reserve, and whatever remains is ours.
+		"""
+		k = TUNED
+		if days_left <= 15:
+			return 0
+		others = max(0.0, turn.total_spent - self.my_spend) / max(turn.day, 1)
+		reserve = max(4 * PACK_COST, 0.03 * (turn.total_spent + left))
+		slack = left - reserve - others * days_left
+		if slack <= 0:
+			self.bank = 0.0
+			return 0
+		self.bank = min(self.bank + slack / SOCK_COST / days_left, k.bank_cap)
+		return min(k.priced_tosses_per_turn, int(self.bank))
+
+	def misfit(self, shade: int) -> float:
+		"""Expected mismatch against a random same-colour partner: part the
+		drawer we see now, part the drawer our spending is steering towards."""
+		seen = self.memory.same_colour(shade)
+		weight = sum(seen.values())
+		now = sum(w * charge(shade, s) for s, w in seen.items()) / weight if weight else 0.0
+		top = min(64, max(1, int(self.target_wears)))
+		new, step = (WHITE_NEW, -2) if is_white(shade) else (BLACK_NEW, 1)
+		later = sum(charge(shade, new + step * a) for a in range(top + 1)) / (top + 1)
+		return (1 - self.trust_target) * now + self.trust_target * later
