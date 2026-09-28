@@ -28,6 +28,17 @@ PARAMS = {
 	# only swap a sock out if a new one would find a free match this much
 	# more often
 	'gain_min': 0.1,
+	# tight money: how many swaps we can make in one turn
+	'max_swaps': 2,
+	# tight money: swap socks in this wash range (fresh ones will fit in by
+	# themselves, worn out ones still match the other old socks)
+	'swap_age_lo': 3,
+	'swap_age_hi': 30,
+	# tight money: keep worn out socks instead of paying to replace them
+	'keep_worn_tight': 1,
+	# only toss freely if the house's spending pace so far, kept up until the
+	# end, still leaves the money we need for holes
+	'pace_guard': 1,
 }
 
 
@@ -175,6 +186,11 @@ class Player7(BasePlayer):
 			if not have_money and self.broke_since is None:
 				self.broke_since = turn.day
 			can_spend = have_money and left / days_left >= p['spend_per_rm'] * self.roommates
+			# don't go on a tossing spree if the whole house is already spending too fast
+			if can_spend and p['pace_guard'] and turn.day > 20:
+				pace = turn.total_spent / turn.day
+				hole_bill = p['hole_rate'] * self.roommates * days_left * SOCK_COST
+				can_spend = pace * days_left <= left - p['low_reserve'] * hole_bill
 			short = self.will_run_dry(turn, left if have_money else 0.0, days_left)
 			# low budget - whatever we don't need for holes is spare. spread it
 			# over the days left and split it between roommates so copies of
@@ -202,23 +218,28 @@ class Player7(BasePlayer):
 			if worn_out(shade):
 				# worn out socks go while there's money to replace them, but
 				# if we're about to run dry every sock counts so keep it
-				if have_money and not short:
+				# with tight money a worn out sock still matches the other old ones
+				tight = not can_spend and p['keep_worn_tight']
+				if have_money and not short and not tight:
 					discard_idx.append(idx)
 			elif can_spend and shade != worn_shade and age(shade) >= p['protect_age']:
 				# plenty of money - drop the odd ones out so the drawer stays tight
 				discard_idx.append(idx)
 
-		# tight money - use the small spare credit on the one sock that fits
-		# in worst with the rest of the drawer
-		if have_money and not can_spend and not short and self.credit >= 1.0:
+		# tight money - spend the small spare credit on a couple of mid-aged socks
+		# that fit in worst with the rest of the drawer, worst fit first
+		if have_money and not can_spend and not short:
 			options = [
-				i for i in leftovers if i not in discard_idx and age(offered[i]) >= p['protect_age']
+				i
+				for i in leftovers
+				if i not in discard_idx and p['swap_age_lo'] <= age(offered[i]) <= p['swap_age_hi']
 			]
-			if options:
-				best = max(options, key=lambda i: self.swap_gain(offered[i]))
-				if self.swap_gain(offered[best]) >= p['gain_min']:
-					discard_idx.append(best)
-					self.credit -= 1.0
+			options.sort(key=lambda i: -self.swap_gain(offered[i]))
+			for i in options[: p['max_swaps']]:
+				if self.credit < 1.0 or self.swap_gain(offered[i]) < p['gain_min']:
+					break
+				discard_idx.append(i)
+				self.credit -= 1.0
 
 		if self.solo:
 			self.solo_after(offered, wear_idx, discard_idx)
