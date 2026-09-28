@@ -94,7 +94,8 @@ class Player7(BasePlayer):
 
 	def free_match_chance(self, shade: int) -> float:
 		# chance at least one of the other socks in a hand is within 6 shades
-		# of this one, based on what we've been seeing
+		# of this one - from the real drawer if we live alone, else from what
+		# we've been seeing lately
 		if self.solo:
 			white = shade > 64
 			hist = {k: v for k, v in self.drawer.items() if (k > 64) == white}
@@ -151,7 +152,7 @@ class Player7(BasePlayer):
 			else:
 				back.append((shade, 1.0))
 		self.last_hand = back
-		# colours whose waiting-for-replacement count may have gone up today
+		# which colours we tossed or wore out today (so a pack could be for them)
 		self.touched = {
 			'w' if offered[i] > 64 else 'b'
 			for i in range(len(offered))
