@@ -83,6 +83,8 @@ class Knobs:
 	# priced regime: most discard credit we can bank, and use in one turn
 	bank_cap: float = 10.0
 	priced_tosses_per_turn: int = 2
+	# priced regime: packs of money never touched, against roommates' lumpy spending
+	reserve_packs: int = 1
 
 
 TUNED = Knobs()
@@ -484,7 +486,7 @@ class Player74(BasePlayer):
 		if days_left <= 15:
 			return 0
 		others = max(0.0, turn.total_spent - self.my_spend) / max(turn.day, 1)
-		reserve = max(4 * PACK_COST, 0.03 * (turn.total_spent + left))
+		reserve = max(k.reserve_packs * PACK_COST, 0.03 * (turn.total_spent + left))
 		slack = left - reserve - others * days_left
 		if slack <= 0:
 			self.bank = 0.0
