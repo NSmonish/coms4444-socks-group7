@@ -1,23 +1,18 @@
-"""Player 74: pick a spending regime from the budget, then play it out.
-
-The budget decides almost everything, so on the first morning we work out how
-many wears each sock would have to last if the household spent its money at a
-steady rate (the house wears 2n socks a day; with d affordable new socks a
-day, each sock has to last 2n/d wears). That number puts us in one of three
-regimes for the rest of the run:
-
-- LAVISH  money is no object - toss anything that stands out from the
-  pair we wore, so the drawer stays bunched up near new.
-- PACED   money is moderate - toss anything that has outlived its share
-  of wears, which spends the budget evenly instead of in bursts.
-- PRICED  money is thin - every move gets a price in embarrassment
-  points, and we take the cheapest one.
-
-Ideas borrowed from other groups, reimplemented here:
-- the 2n/d steady-state wear count (group 10)
-- pricing a whole move - mismatch, dollars and drawer shape - in one
-  number, and counting a worn out sock's hole risk as money (group 3)
-"""
+# player 7 - pick how to spend from the budget on day 1, then stick with it.
+#
+# on the first morning we work out how many wears each sock would need to last
+# if the house spent its money evenly (the house wears 2n socks a day, so if we
+# can afford d new socks a day each one has to last about 2n/d wears). that
+# number puts us in one of three modes for the rest of the run:
+#   lavish - plenty of money, toss anything that doesn't match what we wore
+#   paced  - some money, toss socks once they've had their share of wears so
+#            the budget gets used evenly instead of all at once
+#   priced - not much money, give every move a cost in embarrassment points
+#            and pick the cheapest one
+#
+# ideas we took from other groups and wrote our own way: the 2n/d wear count
+# (group 10), and scoring a whole move - mismatch, money and drawer fit - as one
+# number, with a worn out sock's hole risk counted as money (group 3)
 
 from dataclasses import dataclass, replace
 from itertools import combinations
@@ -39,7 +34,7 @@ BLACK_NEW, BLACK_DONE = 0, 64
 
 @dataclass(frozen=True)
 class Knobs:
-	"""Every tunable number, with what it does."""
+	# all the numbers we can tweak, with what they do
 
 	# lavish tossing needs at least this much money per roommate per day
 	lavish_per_roommate: float = SOCK_COST / 2
@@ -51,7 +46,7 @@ class Knobs:
 	dry_margin: int = 4
 	# never toss a sock with fewer wears than this
 	min_toss_wears: int = 2
-	# daily fade of old sightings in the drawer memory (ruled regimes)
+	# daily fade of old sightings in the drawer memory (ruled modes)
 	memory_fade: float = 0.97
 	# how many hole replacements' worth of money to hold back
 	hole_reserve: float = 1.0
@@ -70,20 +65,20 @@ class Knobs:
 	tight_drawer: float = 1.5
 	# ...and a budget is thin below this many dollars per roommate per day
 	thin_dollars: float = 0.05
-	# paced regime only while each sock must last at most this many wears
+	# paced mode only while each sock must last at most this many wears
 	paced_max_wears: float = 25
-	# priced regime when, on day 1, each sock must last more than this
+	# priced mode when, on day 1, each sock must last more than this
 	priced_min_wears: float = 13
-	# priced regime: points per dollar when the credit bank is empty
+	# priced mode: points per dollar when the credit bank is empty
 	point_per_dollar: float = 3.0
-	# priced regime: weight on how much better a fresh sock would fit
+	# priced mode: weight on how much better a fresh sock would fit
 	fit_weight: float = 1.0
-	# priced regime: daily fade of old sightings
+	# priced mode: daily fade of old sightings
 	priced_memory_fade: float = 0.9
-	# priced regime: most discard credit we can bank, and use in one turn
+	# priced mode: most discard credit we can bank, and use in one turn
 	bank_cap: float = 10.0
 	priced_tosses_per_turn: int = 2
-	# priced regime: packs of money never touched, against roommates' lumpy spending
+	# priced mode: packs of money we never touch, in case roommates spend in bursts
 	reserve_packs: int = 1
 
 
@@ -108,17 +103,17 @@ def is_white(shade: int) -> bool:
 
 
 def wears(shade: int) -> int:
-	"""Rough wash count: white fades 2 a wash, black darkens 1."""
+	# rough wash count - white fades 2 a wash, black goes up 1
 	return (WHITE_NEW - shade) // 2 if is_white(shade) else shade
 
 
 def is_done(shade: int) -> bool:
-	"""Faded all the way, so every wear risks a hole."""
+	# faded all the way, so every wear could put a hole in it
 	return shade in (WHITE_DONE, BLACK_DONE)
 
 
 def charge(a: int, b: int) -> int:
-	"""What the engine bills for wearing a and b together."""
+	# what the engine charges for wearing a and b together
 	gap = abs(a - b)
 	return gap if gap > FREE_GAP else 0
 
@@ -141,7 +136,7 @@ def colour(shade: int) -> str:
 
 
 class ShadeMemory:
-	"""Decayed counts of the shades we've been handed, per colour."""
+	# faded counts of the shades we've been handed, per colour
 
 	def __init__(self, fade: float, forget_below: float) -> None:
 		self.fade = fade
@@ -169,11 +164,9 @@ class ShadeMemory:
 
 
 class SoloLedger:
-	"""Living alone we can follow the whole drawer, shade -> how many.
-
-	Holes are the one thing we can't see, so a worn out sock we wear comes
-	back counted as 0.75 of a sock and the other 0.25 waits for a new pack.
-	"""
+	# living alone we can keep track of the whole drawer: shade -> how many.
+	# holes are the one thing we can't see, so a worn out sock we wear comes back
+	# counted as 0.75 of a sock and the other 0.25 waits for a new pack
 
 	def __init__(self, capacity: int) -> None:
 		half = float(capacity // 2)
@@ -235,18 +228,18 @@ class SoloLedger:
 
 
 def hole_money(k: Knobs, roommates: int, days: int) -> float:
-	"""Money to hold back for replacing holes over this many days."""
+	# money to keep back for replacing holes over this many days
 	return k.hole_reserve * k.hole_rate * roommates * days * SOCK_COST
 
 
 def socks_per_day(k: Knobs, money: float, roommates: int, days: int) -> float:
-	"""New socks a day the house can afford once the hole money is set aside."""
+	# new socks a day the house can afford after setting aside the hole money
 	return (money - hole_money(k, roommates, days)) / days / SOCK_COST
 
 
 @dataclass
 class Wallet:
-	"""Where the household's money stands this morning."""
+	# where the house's money stands this morning
 
 	have_money: bool = True
 	lavish: bool = True
@@ -260,17 +253,17 @@ class Wallet:
 # ----------------------------------------------------------------------
 
 
-class Player74(BasePlayer):
+class Player7(BasePlayer):
 	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
 		super().__init__(snapshot, ctx)
 		self.regime: str | None = None
 		self.knobs = TUNED
 		self.memory = ShadeMemory(TUNED.memory_fade, 0.01)
 		self.solo = SoloLedger(self.capacity) if self.roommates == 1 else None
-		# ruled regimes
+		# ruled modes
 		self.broke_since: int | None = None
 		self.swap_credit = 0.0
-		# priced regime
+		# priced mode
 		self.bank = 0.0
 		self.my_spend = 0.0
 		self.target_wears = 64.0
@@ -477,11 +470,9 @@ class Player74(BasePlayer):
 		return Selection(wear=wear, discard=toss)
 
 	def fill_bank(self, turn: TurnContext, left: float, days_left: int) -> int:
-		"""Bank our share of today's spare money; return tosses allowed today.
-
-		What the house spent minus what we spent is the roommates' pace. Project
-		it forward, keep a reserve, and whatever remains is ours.
-		"""
+		# put our share of today's spare money in the bank and say how many tosses
+		# we get today. what the house spent minus what we spent is how fast the
+		# roommates spend - assume they keep that up, keep a reserve, rest is ours
 		k = TUNED
 		if days_left <= 15:
 			return 0
@@ -495,8 +486,8 @@ class Player74(BasePlayer):
 		return min(k.priced_tosses_per_turn, int(self.bank))
 
 	def misfit(self, shade: int) -> float:
-		"""Expected mismatch against a random same-colour partner: part the
-		drawer we see now, part the drawer our spending is steering towards."""
+		# how badly this shade would match a random sock of the same colour -
+		# partly the drawer we see now, partly the one our spending is heading for
 		seen = self.memory.same_colour(shade)
 		weight = sum(seen.values())
 		now = sum(w * charge(shade, s) for s, w in seen.items()) / weight if weight else 0.0
